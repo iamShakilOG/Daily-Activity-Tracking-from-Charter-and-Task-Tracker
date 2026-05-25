@@ -3,11 +3,9 @@ name: Resource Daily Activity Report
 on:
   schedule:
     # Bangladesh time (Asia/Dhaka, GMT+6):
-    # 10:00, 15:00, 23:00
+    # every hour at minute 40
     # GitHub Actions cron uses UTC.
-    - cron: "0 4 * * *"
-    - cron: "0 9 * * *"
-    - cron: "0 17 * * *"
+    - cron: "40 * * * *"
   workflow_dispatch:
 
 permissions:

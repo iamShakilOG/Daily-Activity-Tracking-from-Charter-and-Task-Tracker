@@ -12,9 +12,7 @@ It runs the script:
 
 The workflow is scheduled for Bangladesh time (`Asia/Dhaka`, `GMT+6`) at:
 
-- `10:00`
-- `15:00`
-- `23:00`
+- every hour, at minute `40`
 
 GitHub Actions cron uses UTC, so the workflow file contains the UTC equivalents.
 
