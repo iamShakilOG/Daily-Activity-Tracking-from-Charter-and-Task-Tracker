@@ -975,6 +975,24 @@ def build_row_values_by_positions(headers, header_positions, row_data, existing_
     return values
 
 
+def build_managed_cell_updates(sheet_row_number, header_positions, row_data):
+    normalized_row_data = {
+        _normalize_cell(key): "" if value is None else str(value).replace("nan", "")
+        for key, value in row_data.items()
+    }
+    updates = []
+
+    for header, idx in header_positions.items():
+        updates.append(
+            {
+                "range": rowcol_to_a1(sheet_row_number, idx + 1),
+                "values": [[normalized_row_data.get(_normalize_cell(header), "")]],
+            }
+        )
+
+    return updates
+
+
 def build_local_resource_pool_indexes(df, resolved_pool_columns):
     qai_id_col = resolved_pool_columns["QAI ID"]
     project_name_col = resolved_pool_columns["Project Name"]
@@ -1715,11 +1733,13 @@ def update_local_resource_pool_sheet(today_activity_df, all_errors=None, project
             existing_values=existing_values,
         )
         update_values = clean_sheet_rows([row_values])
-        ensure_worksheet_has_rows(ws, sheet_row_number)
-        ws.update(
-            range_name=f"A{sheet_row_number}",
-            values=update_values
+        managed_cell_updates = build_managed_cell_updates(
+            sheet_row_number,
+            managed_header_positions,
+            row_data,
         )
+        ensure_worksheet_has_rows(ws, sheet_row_number)
+        ws.batch_update(managed_cell_updates, value_input_option="USER_ENTERED")
         log(f"✅ Updated row {sheet_row_number}: {row_data['QAI ID']}")
         df.iloc[matched_idx] = update_values[0]
         current_qai_id = clean_sheet_text(row_data["QAI ID"])
@@ -1731,8 +1751,13 @@ def update_local_resource_pool_sheet(today_activity_df, all_errors=None, project
 
     # Append new rows
     if new_rows:
+        next_row_number = header_row_idx + len(df) + 2
+        ensure_worksheet_has_rows(ws, next_row_number + len(new_rows) - 1)
         append_values = []
-        for row_data in new_rows:
+        append_updates = []
+
+        for offset, row_data in enumerate(new_rows):
+            sheet_row_number = next_row_number + offset
             append_values.append(
                 build_row_values_by_positions(
                     headers,
@@ -1740,14 +1765,16 @@ def update_local_resource_pool_sheet(today_activity_df, all_errors=None, project
                     row_data,
                 )
             )
-        append_values = clean_sheet_rows(append_values)
+            append_updates.extend(
+                build_managed_cell_updates(
+                    sheet_row_number,
+                    managed_header_positions,
+                    row_data,
+                )
+            )
 
-        next_row_number = header_row_idx + len(df) + 2
-        ensure_worksheet_has_rows(ws, next_row_number + len(append_values) - 1)
-        ws.update(
-            range_name=f"A{next_row_number}",
-            values=append_values
-        )
+        append_values = clean_sheet_rows(append_values)
+        ws.batch_update(append_updates, value_input_option="USER_ENTERED")
         log(f"✅ Appended {len(append_values)} new row(s) starting at A{next_row_number}.")
         append_df = pd.DataFrame(append_values, columns=headers)
         start_idx = len(df)
