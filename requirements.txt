@@ -1,0 +1,8 @@
+gspread
+numpy
+oauth2client
+pandas
+python-dotenv
+pytz
+requests
+tqdm
