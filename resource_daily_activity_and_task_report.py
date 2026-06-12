@@ -50,6 +50,9 @@ audit_sheet = None
 resource_type_map = {}
 SERVICE_ACCOUNT_EMAIL = ""
 AUDIT_LOG_TAB = "Run Errors"
+LOCAL_RESOURCE_POOL_REFERENCE_SHEET = "Assign"
+DAILY_PROJECT_PROGRESS_SHEET = "Daily Project Progress"
+LATEST_MEMBER_STATUS_SHEET = "Latest Member Status"
 spreadsheet_cache = {}
 worksheet_cache = {}
 local_resource_pool_cache = {
@@ -98,6 +101,27 @@ MANUAL_RESOURCE_POOL_REQUIRED_HEADERS = [
     "QAI ID Status",
     "Remarks",
     "Current Designation",
+]
+DAILY_PROJECT_PROGRESS_HEADERS = [
+    "Snapshot Timestamp",
+    "Snapshot Date",
+    "Snapshot Time",
+    "Project Name",
+    "Start Date",
+    "Ticket Status",
+    "QAI ID",
+    "Full Name",
+    "Email",
+    "Contact",
+    "Client Alias",
+    "Task Tracker Link",
+    "Engagement (today)",
+    "Charter Team Status",
+    "Task Tracker Activity (today)",
+    "Today Task Tracker Activity (Annotation)",
+    "Today Task Tracker Activity (QC)",
+    "Annotation Accuracy (today)",
+    "QC Accuracy (today)",
 ]
 
 def normalize_service_account_json(value):
@@ -262,6 +286,31 @@ def get_custom_field_value(task, field_name):
         if field.get("name") == field_name:
             return normalize_field_value(field.get("value"))
     return ""
+
+
+def format_clickup_date_value(value):
+    if value in (None, ""):
+        return ""
+
+    text_value = str(value).strip()
+    if not text_value:
+        return ""
+
+    try:
+        timestamp = int(float(text_value))
+        if timestamp > 10**12:
+            timestamp = timestamp / 1000
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return text_value
+
+
+def get_task_start_date(task):
+    task_start_date = format_clickup_date_value(task.get("start_date"))
+    if task_start_date:
+        return task_start_date
+
+    return format_clickup_date_value(get_custom_field_value(task, "Start Date"))
 
 
 def extract_emails(text):
@@ -450,7 +499,7 @@ def get_local_resource_pool_context(all_errors=None, project_name=""):
 
     ws = safe_get_worksheet(
         spreadsheet=sh,
-        title="Assign",
+        title=LOCAL_RESOURCE_POOL_REFERENCE_SHEET,
         project_name=project_name or "Local Resource Pool",
         all_errors=all_errors if all_errors is not None else [],
         sheet_kind="Local resource pool sheet",
@@ -461,7 +510,7 @@ def get_local_resource_pool_context(all_errors=None, project_name=""):
     data = read_worksheet_values(
         ws,
         project_name=project_name or "Local Resource Pool",
-        sheet_name="Assign",
+        sheet_name=LOCAL_RESOURCE_POOL_REFERENCE_SHEET,
     )
     if not data:
         headers = []
@@ -529,6 +578,9 @@ TARGET_STATUS_NAMES = [
     "pending schedule approval",
 ]
 
+TARGET_STATUS_NAME_SET = {status.strip().lower() for status in TARGET_STATUS_NAMES}
+WORKED_CHARTER_STATUS_SET = {"active", "inactive", "offboarded"}
+
 def fetch_clickup_tasks():
     headers = {"Authorization": CLICKUP_API_TOKEN}
     tasks = []
@@ -542,7 +594,6 @@ def fetch_clickup_tasks():
                 "page": page,
                 "include_closed": True,
                 "include_archived": True,
-                "statuses[]": TARGET_STATUS_NAMES,
             },
             timeout=30,
         )
@@ -558,7 +609,7 @@ def fetch_clickup_tasks():
         tasks.extend(batch)
         page += 1
 
-    log(f"✅ Total ClickUp projects (selected status): {len(tasks)}")
+    log(f"✅ Total ClickUp projects fetched: {len(tasks)}")
     return tasks
 
 def filter_tasks_for_test_run(tasks):
@@ -630,6 +681,13 @@ def clear_or_create_worksheet(spreadsheet, title, rows=1000, cols=20):
         log(f"⚠️ Failed to clear worksheet '{title}': {e}, creating new one")
         return spreadsheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
+def get_or_create_worksheet(spreadsheet, title, rows=1000, cols=20):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        log(f"ℹ️ Worksheet '{title}' not found, creating it.")
+        return spreadsheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+
 def delete_worksheet_if_exists(spreadsheet, title):
     try:
         ws = spreadsheet.worksheet(title)
@@ -645,6 +703,13 @@ def ensure_worksheet_has_rows(worksheet, required_row_count):
         return
 
     worksheet.add_rows(required_row_count - current_rows)
+
+def ensure_worksheet_has_cols(worksheet, required_col_count):
+    current_cols = int(getattr(worksheet, "col_count", 0) or 0)
+    if required_col_count <= current_cols:
+        return
+
+    worksheet.add_cols(required_col_count - current_cols)
 
 def upload(df, sheet, tab):
     try:
@@ -1304,11 +1369,14 @@ def build_today_activity_report(data, qai_id_status_map, today_bd_date, project_
     output_columns = [
         "QAI ID",
         "Engagement (today)",
+        "Charter Team Status",
         "Today Task Tracker Activity (Annotation)",
         "Today Task Tracker Activity (QC)",
     ]
 
-    # convert active users set
+    # Build rows for every remote charter member so charter-side status changes
+    # are captured even when someone is no longer Active.
+    charter_qais = list(qai_id_status_map.keys())
     active_qais = {
         k for k, v in qai_id_status_map.items()
         if str(v).strip().lower() == "active"
@@ -1352,10 +1420,11 @@ def build_today_activity_report(data, qai_id_status_map, today_bd_date, project_
 
     # breakpoint()
 
-    for qai in active_qais:
+    for qai in charter_qais:
+        charter_status = clean_sheet_text(qai_id_status_map.get(qai, ""))
 
-        # missing active QAIs in sheet
-        if qai not in present_qais:
+        # Only flag missing rows for members that are currently Active.
+        if qai in active_qais and qai not in present_qais:
             all_errors.append({
                 "project": project_name,
                 "issue": f"{qai} is Active but missing in sheet for {today_str}"
@@ -1363,7 +1432,8 @@ def build_today_activity_report(data, qai_id_status_map, today_bd_date, project_
 
         out_rows.append({
             "QAI ID": qai,
-            "Engagement (today)": "Yes",
+            "Engagement (today)": charter_status,
+            "Charter Team Status": charter_status,
             "Today Task Tracker Activity (Annotation)": annotation_map.get(qai, 0),
             "Today Task Tracker Activity (QC)": qc_map.get(qai, 0),
         })
@@ -1604,265 +1674,228 @@ def get_tracker_data(qai_id_and_status_map, all_errors, project_name,tracker_url
 #     else:
 #         print("No matching QAI IDs found.")
 
-def update_local_resource_pool_sheet(today_activity_df, all_errors=None, project_name=""):
-    ws, headers, df, header_row_idx, cached_resolved_pool_columns, qai_project_row_map, qai_first_row_map, qai_blank_project_row_map = get_local_resource_pool_context(
+def get_member_reference_lookup(all_errors=None, project_name=""):
+    _, _, df, _, resolved_pool_columns, _, _, _ = get_local_resource_pool_context(
         all_errors=all_errors,
         project_name=project_name,
     )
-    if ws is None or header_row_idx is None:
-        return
+    if df is None or df.empty or not resolved_pool_columns:
+        return {}
 
-    resolved_pool_columns = cached_resolved_pool_columns or {}
-    missing_pool_columns = [
-        col for col in ["QAI ID", "Project Name", "Full Name", "Email", "Contact"]
-        if col not in resolved_pool_columns
-    ]
-    managed_header_positions, missing_managed_headers = resolve_header_positions(
-        headers,
-        [
-            "QAI ID",
-            "Full Name",
-            "Email",
-            "Contact",
-            "Client Alias",
-            "Project Name",
-            "Task Tracker Link",
-            "Engagement (today)",
-            "Task Tracker Activity (today)",
-            "Today Task Tracker Activity (Annotation)",
-            "Today Task Tracker Activity (QC)",
-            "Annotation Accuracy (today)",
-            "QC Accuracy (today)",
-        ],
-    )
+    missing_pool_columns = [col for col in ["QAI ID", "Full Name", "Email", "Contact"] if col not in resolved_pool_columns]
     if missing_pool_columns:
         add_project_error(
             all_errors if all_errors is not None else [],
             project_name or "Local Resource Pool",
-            "Local resource pool sheet column missing: "
-            + ", ".join(sorted(missing_pool_columns)),
+            "Local resource pool sheet column missing: " + ", ".join(sorted(missing_pool_columns)),
         )
-        return
-    if missing_managed_headers:
-        add_project_error(
-            all_errors if all_errors is not None else [],
-            project_name or "Local Resource Pool",
-            "Local resource pool sheet column missing: "
-            + ", ".join(sorted(missing_managed_headers)),
-        )
-        return
+        return {}
 
     qai_id_col = resolved_pool_columns["QAI ID"]
-    project_name_col = resolved_pool_columns["Project Name"]
     full_name_col = resolved_pool_columns["Full Name"]
     email_col = resolved_pool_columns["Email"]
     contact_col = resolved_pool_columns["Contact"]
+    member_lookup = {}
+
+    for _, row in df.iterrows():
+        qai_id = clean_sheet_text(row.get(qai_id_col, ""))
+        if not qai_id or qai_id in member_lookup:
+            continue
+        member_lookup[qai_id] = {
+            "Full Name": clean_sheet_text(row.get(full_name_col, "")),
+            "Email": clean_sheet_text(row.get(email_col, "")),
+            "Contact": clean_sheet_text(row.get(contact_col, "")),
+        }
+
+    return member_lookup
+
+
+def build_daily_project_progress_rows(today_activity_df, member_lookup):
+    bd_now = datetime.now(pytz.timezone("Asia/Dhaka"))
+    snapshot_timestamp = bd_now.strftime("%Y-%m-%d %H:%M:%S")
+    snapshot_date = bd_now.strftime("%Y-%m-%d")
+    snapshot_time = bd_now.strftime("%H:%M:%S")
 
     today_activity_df.columns = today_activity_df.columns.str.strip()
-
-    # Remove accidental index column if present
     today_activity_df = today_activity_df.loc[
         :,
         ~today_activity_df.columns.str.contains("^Unnamed")
     ]
 
-    new_rows = []
-    rows_to_update = []
-
+    progress_rows = []
     for _, activity_row in today_activity_df.iterrows():
         qai_id = clean_sheet_text(activity_row["QAI ID"])
-        project_name = clean_sheet_text(activity_row.get("Project Name", ""))
-
-        # Build new row data - convert NaN to empty string immediately
-        new_row_data = {
+        member_info = member_lookup.get(qai_id, {})
+        annotation_count = clean_sheet_value(activity_row.get("Today Task Tracker Activity (Annotation)", ""))
+        qc_count = clean_sheet_value(activity_row.get("Today Task Tracker Activity (QC)", ""))
+        tracker_activity = (
+            "Yes"
+            if str(annotation_count).strip() not in ["", "0", "0.0"]
+            or str(qc_count).strip() not in ["", "0", "0.0"]
+            else ""
+        )
+        progress_rows.append({
+            "Snapshot Timestamp": snapshot_timestamp,
+            "Snapshot Date": snapshot_date,
+            "Snapshot Time": snapshot_time,
+            "Project Name": clean_sheet_text(activity_row.get("Project Name", "")),
+            "Start Date": clean_sheet_text(activity_row.get("Start Date", "")),
+            "Ticket Status": clean_sheet_text(activity_row.get("Ticket Status", "")),
             "QAI ID": qai_id,
-            "Full Name": "",
-            "Email": "",
-            "Contact": "",
-            "Client Alias": str(activity_row.get("Client Alias","")).replace("nan", ""),
-            "Project Name": str(activity_row.get("Project Name","")).replace("nan", ""),
-            "Task Tracker Link": str(activity_row.get("Task Tracker Link","")).replace("nan", ""),
-            "Engagement (today)": str(activity_row.get("Engagement (today)", "")).replace("nan", ""),
-            "Task Tracker Activity (today)": (
-                "Yes"
-                if str(activity_row.get("Today Task Tracker Activity (Annotation)", "")).strip() not in ["", "0", "0.0", "nan", "None",0,0.0]
-                or str(activity_row.get("Today Task Tracker Activity (QC)", "")).strip() not in ["", "0", "0.0", "nan", "None",0,0.0]
-                else ""
-            ),
-            "Today Task Tracker Activity (Annotation)": str(activity_row.get("Today Task Tracker Activity (Annotation)", "")).replace("nan", ""),
-            "Today Task Tracker Activity (QC)": str(activity_row.get("Today Task Tracker Activity (QC)", "")).replace("nan", ""),
-            "Annotation Accuracy (today)": str(activity_row.get("Annotation Accuracy (today)", "")).replace("nan", ""),
-            "QC Accuracy (today)": str(activity_row.get("QC Accuracy (today)", "")).replace("nan", ""),
-        }
+            "Full Name": clean_sheet_text(member_info.get("Full Name", "")),
+            "Email": clean_sheet_text(member_info.get("Email", "")),
+            "Contact": clean_sheet_text(member_info.get("Contact", "")),
+            "Client Alias": clean_sheet_text(activity_row.get("Client Alias", "")),
+            "Task Tracker Link": clean_sheet_text(activity_row.get("Task Tracker Link", "")),
+            "Engagement (today)": clean_sheet_text(activity_row.get("Engagement (today)", "")),
+            "Charter Team Status": clean_sheet_text(activity_row.get("Charter Team Status", "")),
+            "Task Tracker Activity (today)": tracker_activity,
+            "Today Task Tracker Activity (Annotation)": annotation_count,
+            "Today Task Tracker Activity (QC)": qc_count,
+            "Annotation Accuracy (today)": clean_sheet_text(activity_row.get("Annotation Accuracy (today)", "")),
+            "QC Accuracy (today)": clean_sheet_text(activity_row.get("QC Accuracy (today)", "")),
+        })
 
-        matched_idx = qai_project_row_map.get((qai_id, project_name))
-        if matched_idx is not None:
-            matched = df.iloc[matched_idx]
-            new_row_data["Full Name"] = str(matched.get(full_name_col, "")).replace("nan", "")
-            new_row_data["Email"] = str(matched.get(email_col, "")).replace("nan", "")
-            new_row_data["Contact"] = str(matched.get(contact_col, "")).replace("nan", "")
-
-            sheet_row_number = header_row_idx + matched_idx + 2
-            existing_values = df.iloc[matched_idx].tolist()
-            rows_to_update.append((sheet_row_number, matched_idx, new_row_data, existing_values))
-        elif qai_id in qai_blank_project_row_map:
-            matched_idx = qai_blank_project_row_map[qai_id]
-            matched = df.iloc[matched_idx]
-            new_row_data["Full Name"] = str(matched.get(full_name_col, "")).replace("nan", "")
-            new_row_data["Email"] = str(matched.get(email_col, "")).replace("nan", "")
-            new_row_data["Contact"] = str(matched.get(contact_col, "")).replace("nan", "")
-
-            sheet_row_number = header_row_idx + matched_idx + 2
-            existing_values = df.iloc[matched_idx].tolist()
-            rows_to_update.append((sheet_row_number, matched_idx, new_row_data, existing_values))
-        elif qai_id in qai_first_row_map:
-            matched = df.iloc[qai_first_row_map[qai_id]]
-            new_row_data["Full Name"] = str(matched.get(full_name_col, "")).replace("nan", "")
-            new_row_data["Email"] = str(matched.get(email_col, "")).replace("nan", "")
-            new_row_data["Contact"] = str(matched.get(contact_col, "")).replace("nan", "")
-            new_rows.append(new_row_data)
-        else:
-            new_rows.append(new_row_data)
-
-    # Update existing rows first
-    for sheet_row_number, matched_idx, row_data, existing_values in rows_to_update:
-        row_values = build_row_values_by_positions(
-            headers,
-            managed_header_positions,
-            row_data,
-            existing_values=existing_values,
-        )
-        update_values = clean_sheet_rows([row_values])
-        managed_cell_updates = build_managed_cell_updates(
-            sheet_row_number,
-            managed_header_positions,
-            row_data,
-        )
-        ensure_worksheet_has_rows(ws, sheet_row_number)
-        ws.batch_update(managed_cell_updates, value_input_option="USER_ENTERED")
-        log(f"✅ Updated row {sheet_row_number}: {row_data['QAI ID']}")
-        df.iloc[matched_idx] = update_values[0]
-        current_qai_id = clean_sheet_text(row_data["QAI ID"])
-        current_project_name = clean_sheet_text(row_data["Project Name"])
-        qai_project_row_map[(current_qai_id, current_project_name)] = matched_idx
-        if current_qai_id not in qai_first_row_map:
-            qai_first_row_map[current_qai_id] = matched_idx
-        qai_blank_project_row_map.pop(current_qai_id, None)
-
-    # Append new rows
-    if new_rows:
-        next_row_number = header_row_idx + len(df) + 2
-        ensure_worksheet_has_rows(ws, next_row_number + len(new_rows) - 1)
-        append_values = []
-        append_updates = []
-
-        for offset, row_data in enumerate(new_rows):
-            sheet_row_number = next_row_number + offset
-            append_values.append(
-                build_row_values_by_positions(
-                    headers,
-                    managed_header_positions,
-                    row_data,
-                )
-            )
-            append_updates.extend(
-                build_managed_cell_updates(
-                    sheet_row_number,
-                    managed_header_positions,
-                    row_data,
-                )
-            )
-
-        append_values = clean_sheet_rows(append_values)
-        ws.batch_update(append_updates, value_input_option="USER_ENTERED")
-        log(f"✅ Appended {len(append_values)} new row(s) starting at A{next_row_number}.")
-        append_df = pd.DataFrame(append_values, columns=headers)
-        start_idx = len(df)
-        df = pd.concat([df, append_df], ignore_index=True)
-        local_resource_pool_cache["df"] = df
-        for offset, row_data in enumerate(new_rows):
-            idx = start_idx + offset
-            qai_id = clean_sheet_text(row_data["QAI ID"])
-            project_name = clean_sheet_text(row_data["Project Name"])
-            qai_project_row_map[(qai_id, project_name)] = idx
-            if qai_id not in qai_first_row_map:
-                qai_first_row_map[qai_id] = idx
-            qai_blank_project_row_map.pop(qai_id, None)
-    else:
-        log("ℹ️ No new rows to append.")
+    return pd.DataFrame(progress_rows, columns=DAILY_PROJECT_PROGRESS_HEADERS)
 
 
-def clear_non_running_project_activity_fields(active_project_names, all_errors=None):
-    ws, headers, df, header_row_idx, _, _, _, _ = get_local_resource_pool_context(
+def normalize_progress_row_for_compare(row):
+    return {
+        header: clean_sheet_text(row.get(header, ""))
+        for header in DAILY_PROJECT_PROGRESS_HEADERS
+        if header not in {"Snapshot Timestamp", "Snapshot Date", "Snapshot Time"}
+    }
+
+
+def get_daily_project_progress_context(all_errors=None, project_name=""):
+    sh = safe_open_spreadsheet_by_url(
+        url=LOCAL_RESOURCE_POOL_URL,
+        project_name=project_name or "Local Resource Pool",
+        all_errors=all_errors if all_errors is not None else [],
+        sheet_kind="Local resource pool sheet",
+    )
+    if sh is None:
+        return None, None, pd.DataFrame(columns=DAILY_PROJECT_PROGRESS_HEADERS)
+
+    ws = get_or_create_worksheet(
+        sh,
+        DAILY_PROJECT_PROGRESS_SHEET,
+        rows=1000,
+        cols=max(20, len(DAILY_PROJECT_PROGRESS_HEADERS)),
+    )
+    ensure_worksheet_has_cols(ws, len(DAILY_PROJECT_PROGRESS_HEADERS))
+
+    data = read_worksheet_values(
+        ws,
+        project_name=project_name or "Local Resource Pool",
+        sheet_name=DAILY_PROJECT_PROGRESS_SHEET,
+    )
+    if not data:
+        ws.update("A1", [DAILY_PROJECT_PROGRESS_HEADERS])
+        return sh, ws, pd.DataFrame(columns=DAILY_PROJECT_PROGRESS_HEADERS)
+
+    header = [clean_sheet_text(col) for col in data[0]]
+    if header != DAILY_PROJECT_PROGRESS_HEADERS:
+        existing_records = worksheet_values_to_records(data)
+        progress_df = pd.DataFrame(existing_records)
+        for header_name in DAILY_PROJECT_PROGRESS_HEADERS:
+            if header_name not in progress_df.columns:
+                progress_df[header_name] = ""
+        progress_df = progress_df[DAILY_PROJECT_PROGRESS_HEADERS]
+        upload(progress_df, sh, DAILY_PROJECT_PROGRESS_SHEET)
+        return sh, sh.worksheet(DAILY_PROJECT_PROGRESS_SHEET), progress_df
+
+    progress_df = pd.DataFrame(data[1:], columns=header)
+    return sh, ws, progress_df
+
+
+def append_daily_project_progress(today_activity_df, all_errors=None, project_name=""):
+    member_lookup = get_member_reference_lookup(
+        all_errors=all_errors,
+        project_name=project_name,
+    )
+    progress_df = build_daily_project_progress_rows(today_activity_df, member_lookup)
+    if progress_df.empty:
+        log("ℹ️ No project progress rows generated for upload.")
+        return
+
+    sh, ws, existing_df = get_daily_project_progress_context(
+        all_errors=all_errors,
+        project_name=project_name,
+    )
+    if sh is None or ws is None:
+        return
+
+    rows_to_append = [
+        [clean_sheet_value(row.get(header, "")) for header in DAILY_PROJECT_PROGRESS_HEADERS]
+        for _, row in progress_df.iterrows()
+    ]
+
+    ensure_worksheet_has_rows(ws, len(existing_df) + len(rows_to_append) + 1)
+    ensure_worksheet_has_cols(ws, len(DAILY_PROJECT_PROGRESS_HEADERS))
+    ws.append_rows(
+        clean_sheet_rows(rows_to_append),
+        value_input_option="USER_ENTERED",
+        table_range="A1",
+    )
+    log(f"✅ Appended {len(rows_to_append)} row(s) to {DAILY_PROJECT_PROGRESS_SHEET}.")
+
+
+def resolve_latest_member_ticket_status(row, project_status_by_name):
+    project_name = clean_sheet_text(row.get("Project Name", ""))
+    clickup_status = clean_sheet_text(project_status_by_name.get(project_name, ""))
+
+    if clickup_status:
+        return clickup_status
+
+    return "Not Available"
+
+
+def resolve_latest_member_engagement(row):
+    current_engagement = clean_sheet_text(row.get("Engagement (today)", ""))
+    charter_status = clean_sheet_text(row.get("Charter Team Status", "")).lower()
+    ticket_status = clean_sheet_text(row.get("Ticket Status", "")).lower()
+
+    if current_engagement.lower() == "removed":
+        return current_engagement
+
+    if (
+        ticket_status not in TARGET_STATUS_NAME_SET
+        and charter_status in WORKED_CHARTER_STATUS_SET
+    ):
+        return "Worked"
+
+    return current_engagement
+
+
+def refresh_latest_member_status_sheet(project_status_by_name=None, all_errors=None):
+    sh, _, progress_df = get_daily_project_progress_context(
         all_errors=all_errors,
         project_name="Local Resource Pool",
     )
-    if ws is None or header_row_idx is None or df.empty:
+    if sh is None:
         return
 
-    resolved_columns, missing_columns = resolve_dataframe_columns(
-        df,
-        ["Project Name", *CLEAR_IF_NOT_RUNNING_HEADERS],
-    )
-    if missing_columns:
-        add_project_error(
-            all_errors if all_errors is not None else [],
-            "Local Resource Pool",
-            "Local resource pool sheet column missing: " + ", ".join(sorted(missing_columns)),
-        )
-        return
+    latest_df = pd.DataFrame(columns=DAILY_PROJECT_PROGRESS_HEADERS)
+    if progress_df is not None and not progress_df.empty:
+        latest_df = progress_df.copy()
+        latest_df = latest_df.replace(r'^\s*$', np.nan, regex=True)
+        latest_df = latest_df.dropna(subset=["QAI ID", "Project Name"], how="all")
+        latest_df = latest_df.drop_duplicates(subset=["QAI ID", "Project Name"], keep="last")
+        latest_df = latest_df[DAILY_PROJECT_PROGRESS_HEADERS].fillna("")
+        project_status_by_name = project_status_by_name or {}
+        if not latest_df.empty:
+            latest_df["Ticket Status"] = latest_df.apply(
+                lambda row: resolve_latest_member_ticket_status(row, project_status_by_name),
+                axis=1,
+            )
+            latest_df["Engagement (today)"] = latest_df.apply(
+                resolve_latest_member_engagement,
+                axis=1,
+            )
 
-    project_name_col = resolved_columns["Project Name"]
-    clear_positions, missing_clear_headers = resolve_header_positions(
-        headers,
-        CLEAR_IF_NOT_RUNNING_HEADERS,
-    )
-    if missing_clear_headers:
-        add_project_error(
-            all_errors if all_errors is not None else [],
-            "Local Resource Pool",
-            "Local resource pool sheet column missing: " + ", ".join(sorted(missing_clear_headers)),
-        )
-        return
-
-    cleared_count = 0
-
-    for idx, row in df.iterrows():
-        project_name = clean_sheet_text(row.get(project_name_col, ""))
-        if not project_name or project_name in active_project_names:
-            continue
-
-        row_values = df.iloc[idx].tolist()
-        should_update = False
-
-        for header, col_idx in clear_positions.items():
-            current_value = clean_sheet_text(row_values[col_idx] if col_idx < len(row_values) else "")
-            if current_value:
-                row_values[col_idx] = ""
-                should_update = True
-
-        if not should_update:
-            continue
-
-        cleaned_row_values = clean_sheet_rows([row_values])[0]
-        sheet_row_number = header_row_idx + idx + 2
-        ensure_worksheet_has_rows(ws, sheet_row_number)
-        ws.update(
-            range_name=f"A{sheet_row_number}",
-            values=[cleaned_row_values],
-        )
-        df.iloc[idx] = cleaned_row_values
-        cleared_count += 1
-
-    if cleared_count:
-        local_resource_pool_cache["df"] = df
-        local_resource_pool_cache["qai_project_row_map"], local_resource_pool_cache["qai_first_row_map"], local_resource_pool_cache["qai_blank_project_row_map"] = build_local_resource_pool_indexes(
-            df,
-            local_resource_pool_cache["resolved_pool_columns"],
-        )
-        log(f"✅ Cleared non-running project activity fields for {cleared_count} row(s) in Assign.")
-    else:
-        log("ℹ️ No non-running project activity fields needed clearing in Assign.")
+    upload(latest_df, sh, LATEST_MEMBER_STATUS_SHEET)
+    log(f"✅ Refreshed {LATEST_MEMBER_STATUS_SHEET} with {len(latest_df)} latest unique row(s).")
 
 
 def main():
@@ -1871,15 +1904,19 @@ def main():
     load_runtime_config()
     authenticate_google()
 
-    tasks = filter_tasks_for_test_run(fetch_clickup_tasks())
+    all_tasks = filter_tasks_for_test_run(fetch_clickup_tasks())
+    tasks = [
+        task for task in all_tasks
+        if normalize_field_value(task.get("status", {}).get("status")).strip().lower() in TARGET_STATUS_NAME_SET
+    ]
     resource_type_map = load_resource_type_lookup()
-    active_project_names = {
-        str(task.get("name", "")).strip()
-        for task in tasks
-        if str(task.get("name", "")).strip()
-    }
 
     all_errors = []
+    project_status_by_name = {
+        clean_sheet_text(task.get("name", "")): normalize_field_value(task.get("status", {}).get("status"))
+        for task in all_tasks
+        if clean_sheet_text(task.get("name", ""))
+    }
 
     total_projects = len(tasks)
 
@@ -1890,6 +1927,7 @@ def main():
             pdl_email = get_custom_field_value(task, "PDL Email")
             pdl = get_custom_field_value(task, "PDL")
             delivery_lead = get_custom_field_value(task, "Delivery Lead")
+            start_date = get_task_start_date(task)
             pdl_for_ignore = pdl_email or pdl
 
             project_audit_context[project_name] = {
@@ -1982,16 +2020,18 @@ def main():
 
             activity_report_df["Client Alias"] = client_alias
             activity_report_df["Project Name"] = project_name
+            activity_report_df["Start Date"] = start_date
             activity_report_df["Task Tracker Link"] = tracker_url
-            
-            update_local_resource_pool_sheet(
+            activity_report_df["Ticket Status"] = clickup_status
+
+            append_daily_project_progress(
                 activity_report_df,
                 all_errors=all_errors,
                 project_name=project_name,
             )
 
-        clear_non_running_project_activity_fields(
-            active_project_names=active_project_names,
+        refresh_latest_member_status_sheet(
+            project_status_by_name=project_status_by_name,
             all_errors=all_errors,
         )
     finally:
