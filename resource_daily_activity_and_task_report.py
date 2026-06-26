@@ -87,20 +87,6 @@ MANUAL_RESOURCE_POOL_REQUIRED_HEADERS = [
     "Full Name",
     "Email",
     "Contact",
-    "Client Alias",
-    "Project Name",
-    "Task Tracker Link",
-    "Engagement (today)",
-    "Task Tracker Activity (today)",
-    "Today Task Tracker Activity (Annotation)",
-    "Today Task Tracker Activity (QC)",
-    "Annotation Accuracy (today)",
-    "QC Accuracy (today)",
-    "Activity STATUS",
-    "Designation",
-    "QAI ID Status",
-    "Remarks",
-    "Current Designation",
 ]
 DAILY_PROJECT_PROGRESS_HEADERS = [
     "Snapshot Timestamp",
@@ -539,9 +525,26 @@ def get_local_resource_pool_context(all_errors=None, project_name=""):
         df.columns = df.columns.str.strip()
         resolved_pool_columns, _ = resolve_dataframe_columns(
             df,
-            ["QAI ID", "Project Name", "Full Name", "Email", "Contact"],
+            MANUAL_RESOURCE_POOL_REQUIRED_HEADERS,
         )
-        if len(resolved_pool_columns) == 5:
+        missing_pool_columns = [
+            col for col in MANUAL_RESOURCE_POOL_REQUIRED_HEADERS
+            if col not in resolved_pool_columns
+        ]
+        if missing_pool_columns:
+            add_project_error(
+                all_errors if all_errors is not None else [],
+                project_name or "Local Resource Pool",
+                "Manual resource pool sheet missing required columns: "
+                + ", ".join(sorted(missing_pool_columns)),
+            )
+            return ws, [], pd.DataFrame(), None, None, {}, {}
+
+        optional_project_columns, _ = resolve_dataframe_columns(df, ["Project Name"])
+        if "Project Name" in optional_project_columns:
+            resolved_pool_columns["Project Name"] = optional_project_columns["Project Name"]
+
+        if "Project Name" in resolved_pool_columns:
             qai_project_row_map, qai_first_row_map, qai_blank_project_row_map = build_local_resource_pool_indexes(
                 df,
                 resolved_pool_columns,
@@ -1060,7 +1063,7 @@ def build_managed_cell_updates(sheet_row_number, header_positions, row_data):
 
 def build_local_resource_pool_indexes(df, resolved_pool_columns):
     qai_id_col = resolved_pool_columns["QAI ID"]
-    project_name_col = resolved_pool_columns["Project Name"]
+    project_name_col = resolved_pool_columns.get("Project Name")
 
     qai_project_row_map = {}
     qai_first_row_map = {}
@@ -1068,7 +1071,7 @@ def build_local_resource_pool_indexes(df, resolved_pool_columns):
 
     for idx, row in df.iterrows():
         qai_id = clean_sheet_text(row.get(qai_id_col, ""))
-        project_name = clean_sheet_text(row.get(project_name_col, ""))
+        project_name = clean_sheet_text(row.get(project_name_col, "")) if project_name_col else ""
 
         if not qai_id:
             continue
@@ -1365,11 +1368,28 @@ def get_bd_date():
     return today_bd_date
 
 
+def parse_tracker_date(value):
+    if value is None or pd.isna(value):
+        return None
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    try:
+        parsed = pd.to_datetime(str(value).strip(), errors="coerce", dayfirst=True)
+        if pd.isna(parsed):
+            return None
+        return parsed.date()
+    except Exception:
+        return None
+
+
 def build_today_activity_report(data, qai_id_status_map, today_bd_date, project_name, all_errors):
     output_columns = [
         "QAI ID",
         "Engagement (today)",
         "Charter Team Status",
+        "Task Tracker Activity (today)",
         "Today Task Tracker Activity (Annotation)",
         "Today Task Tracker Activity (QC)",
     ]
@@ -1382,38 +1402,51 @@ def build_today_activity_report(data, qai_id_status_map, today_bd_date, project_
         if str(v).strip().lower() == "active"
     }
 
-    today_str = today_bd_date.strftime("%d-%b-%Y")
-
-    
-
     # filter today's rows
     today_rows = [
         row for row in data
-        if str(row.get("Date", "")).strip() == today_str
+        if parse_tracker_date(row.get("Date", "")) == today_bd_date
     ]
+    today_str = today_bd_date.strftime("%d-%b-%Y")
 
 
     annotation_map = defaultdict(int)
     qc_map = defaultdict(int)
+    tracker_activity_map = defaultdict(bool)
     present_qais = set()
 
     # process rows
     for row in today_rows:
         annotator = str(row.get("Annotator", "")).strip()
         reviewer = str(row.get("Reviewer", "")).strip()
+        explicit_tracker_activity = clean_sheet_text(
+            row.get(
+                "Task Tracker Activity (today)",
+                row.get("Task Tracker Activity", row.get("Task Tracker Activity (Yes/No)", "")),
+            )
+        )
 
         annotation_count = int(row.get("Task Count") or 0)
         qc_count = int(row.get("Review Task Count") or 0)
+        has_tracker_activity = (
+            explicit_tracker_activity.lower() == "yes"
+            or annotation_count > 0
+            or qc_count > 0
+            or bool(annotator)
+            or bool(reviewer)
+        )
 
         # Annotation side
         if annotator:
             annotation_map[annotator] += annotation_count
             present_qais.add(annotator)
+            tracker_activity_map[annotator] = tracker_activity_map[annotator] or has_tracker_activity
 
         # QC side
         if reviewer:
             qc_map[reviewer] += qc_count
             present_qais.add(reviewer)
+            tracker_activity_map[reviewer] = tracker_activity_map[reviewer] or has_tracker_activity
 
     # build output
     out_rows = []
@@ -1434,6 +1467,7 @@ def build_today_activity_report(data, qai_id_status_map, today_bd_date, project_
             "QAI ID": qai,
             "Engagement (today)": charter_status,
             "Charter Team Status": charter_status,
+            "Task Tracker Activity (today)": "Yes" if tracker_activity_map.get(qai) else "",
             "Today Task Tracker Activity (Annotation)": annotation_map.get(qai, 0),
             "Today Task Tracker Activity (QC)": qc_map.get(qai, 0),
         })
@@ -1728,12 +1762,14 @@ def build_daily_project_progress_rows(today_activity_df, member_lookup):
         member_info = member_lookup.get(qai_id, {})
         annotation_count = clean_sheet_value(activity_row.get("Today Task Tracker Activity (Annotation)", ""))
         qc_count = clean_sheet_value(activity_row.get("Today Task Tracker Activity (QC)", ""))
-        tracker_activity = (
-            "Yes"
-            if str(annotation_count).strip() not in ["", "0", "0.0"]
-            or str(qc_count).strip() not in ["", "0", "0.0"]
-            else ""
-        )
+        tracker_activity = clean_sheet_text(activity_row.get("Task Tracker Activity (today)", ""))
+        if not tracker_activity:
+            tracker_activity = (
+                "Yes"
+                if str(annotation_count).strip() not in ["", "0", "0.0"]
+                or str(qc_count).strip() not in ["", "0", "0.0"]
+                else ""
+            )
         progress_rows.append({
             "Snapshot Timestamp": snapshot_timestamp,
             "Snapshot Date": snapshot_date,
